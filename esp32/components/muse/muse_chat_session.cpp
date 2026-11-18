@@ -78,6 +78,7 @@ extern "C" {
 }
 #include "muse_chat_priv.h"
 #include "muse_options.h"
+#include "muse_tts.h"
 #include "sdkconfig.h"
 #if CONFIG_MUSE_REALTIME_VOICE
 #include "muse_voice_call_priv.h"
@@ -1040,6 +1041,9 @@ static void turn_finish(void)
     s_turn.tts_msg = -1;
     s_turn.silent = false;
     s_turn.mp3_len = 0;
+#if CONFIG_MUSE_TTS
+    muse_tts_abort();   /* a fetch for a dead turn only wastes the API */
+#endif
 }
 
 static void turn_fail(const char *why)
@@ -1999,6 +2003,26 @@ static void start_tts(void)
          * and finishes the message once it's drained.
          */
         m.pcm_start = s_turn.pcm_out;
+#if CONFIG_MUSE_TTS
+        /* Speak it with the external TTS API; tts_poll() feeds the MP3 to
+         * decode() on the session loop, captions following the audio. */
+        if (muse_tts_ready() && s_turn.texts
+            && muse_tts_submit(s_turn.texts + i * TEXT_MAX)) {
+            m.pcm_frames = 0;
+            m.tts = TTS_ACTIVE;
+            s_turn.tts_msg = i;
+            s_turn.silent = false;
+            s_turn.mp3_len = 0;
+            s_turn.mp3_ended = false;
+            s_turn.kbps = 0;
+            s_turn.down_rate = 0;
+            mp3dec_init(&s_turn.dec);
+            ESP_LOGI(TAG, "speaking message %s (%u chars)", m.id, (unsigned)m.len);
+            show_reply_start(m);
+            return;
+        }
+        ESP_LOGW(TAG, "TTS unavailable; captions only");
+#endif
         /* Paced to the text kept: a reply longer than CAPTION_TEXT shows what
          * was kept at reading pace, not stretched over the whole reply's time
          * (the Watcher keeps the rest for review). */
@@ -2123,6 +2147,41 @@ static void decode(void)
         m.tts = TTS_FINISHED;
         s_turn.tts_msg = -1;
     }
+}
+
+/* Moves the external TTS's MP3 into the decode buffer, and ends the message
+ * when the fetch is complete. A failed fetch with nothing decoded yet falls
+ * back to captions at reading pace; one that cut off mid-reply plays what
+ * arrived. */
+static void tts_poll(void)
+{
+    if (s_turn.tts_msg < 0 || s_turn.silent) {
+        return;
+    }
+    uint8_t chunk[2048];
+    size_t n;
+    while ((n = muse_tts_poll(chunk, sizeof(chunk)))) {
+        tts_data(chunk, n);
+    }
+    muse_tts_status_t st = muse_tts_status();
+    if (st == MUSE_TTS_RUNNING) {
+        return;
+    }
+    msg_t &m = s_turn.msgs[s_turn.tts_msg];
+    if (st == MUSE_TTS_FAILED && !s_turn.mp3_len) {
+        ESP_LOGW(TAG, "TTS failed; captions only");
+        s_turn.silent = true;
+        size_t shown = s_turn.texts ? CAPTION_LEN(s_turn.texts + s_turn.tts_msg * TEXT_MAX) : m.len;
+        m.pcm_frames = (uint32_t)(shown * MIC_RATE / TEXT_CHARS_PER_S);
+        return;   /* pace_silently() finishes the message */
+    }
+    if (st == MUSE_TTS_FAILED) {
+        ESP_LOGW(TAG, "TTS cut off; playing what arrived");
+    }
+    while ((n = muse_tts_poll(chunk, sizeof(chunk)))) {   /* one last drain */
+        tts_data(chunk, n);
+    }
+    s_turn.mp3_ended = true;   /* decode() drains the rest, then finishes */
 }
 
 /* Ends the turn once the reply is complete and spoken, or on timeouts. */
@@ -2622,6 +2681,7 @@ static void hatch_task(void *arg)
         }
         if (s_turn.phase == P_WAIT_REPLY) {
             start_tts();
+            tts_poll();
             decode();
         }
         if (!s_connected) {
@@ -2715,6 +2775,9 @@ extern "C" void muse_hatch_start(void)
         s.cap = NDJSON_LINE_MAX;
     }
     s_turn.tts_msg = -1;
+#if CONFIG_MUSE_TTS
+    muse_tts_init();
+#endif
 #if CONFIG_MUSE_REALTIME_VOICE
     muse_voice_call_init();   /* calls stay unavailable if it fails; notes still work */
 #endif

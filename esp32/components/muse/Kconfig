@@ -488,6 +488,40 @@ menu "Muse"
             them. Needs PSRAM. Without it, voice notes go over Home Link's own
             session to its paired VM and replies are shown as text.
 
+    config MUSE_TTS
+        bool "Speak replies with an external TTS API"
+        depends on MUSE_HATCH && SPIRAM
+        default n
+        help
+            Send each reply's text to an OpenAI-compatible speech API (POST
+            /v1/audio/speech, MP3 back) and play it; captions follow the
+            audio. The key is set on the console, like the SDK token:
+            ">tts_key=..." stores it in NVS, ">tts_show" shows the config and
+            ">tts_url=...", ">tts_model=..." and ">tts_voice=..." override
+            the defaults below. A reply whose TTS fails still shows as
+            captions at reading pace.
+
+    config MUSE_TTS_URL
+        string "TTS speech API URL"
+        depends on MUSE_TTS
+        default "https://api.siliconflow.cn/v1/audio/speech"
+        help
+          Any OpenAI-compatible POST /v1/audio/speech endpoint.
+
+    config MUSE_TTS_MODEL
+        string "TTS model"
+        depends on MUSE_TTS
+        default "FunAudioLLM/CosyVoice2-0.5B"
+
+    config MUSE_TTS_VOICE
+        string "TTS voice"
+        depends on MUSE_TTS
+        default "FunAudioLLM/CosyVoice2-0.5B:anna"
+        help
+          SiliconFlow's preset voices are "<model>:alex", ":benny",
+          ":charles", ":david", ":anna", ":bella" and friends; OpenAI's are
+          bare names like "alloy".
+
     config MUSE_REPLY_NOTIFY
         bool "Flash the screen and ping when a reply arrives"
         depends on MUSE_HATCH && !MUSE_UI_FREEINK

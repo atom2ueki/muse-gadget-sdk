@@ -59,6 +59,7 @@ if(CONFIG_MUSE_ENABLED)
     endif()
     if(CONFIG_MUSE_HATCH)
         list(APPEND srcs "muse_chat.c" "muse_account_api.c" "muse_chat_session.cpp" "muse_options_json.c")
+        list(APPEND srcs "muse_tts.c")   # external TTS for replies (CONFIG_MUSE_TTS)
         list(APPEND embed "test_reply.mp3")   # muse_hatch_mp3_selftest
         if(CONFIG_MUSE_REALTIME_VOICE)
             list(APPEND srcs "muse_voice_call.cpp" "muse_voice_call_core.c")

@@ -1,0 +1,14 @@
+# 本地定制配置（叠加在 sdkconfig.muse-sensecap-watcher 之后，最后加载）
+# 中文 CJK 字幕：Noto Sans SC（GB2312 全部 6763 汉字，约 910KB flash）
+CONFIG_MUSE_CJK_FONT=y
+CONFIG_MUSE_CJK_FONT_NOTO=y
+# Watcher 摄像头：拍照 + 滚轮双击实时预览（走 Himax 出厂协议，无需刷 Himax）
+CONFIG_MUSE_WATCHER_CAMERA=y
+# 回复到达时闪屏 + 两声提示音（Watcher 无震动马达的声音提醒）
+CONFIG_MUSE_REPLY_NOTIFY=y
+# 实时语音通话（实验性）：单击 = 与 Muse 实时语音对话，长按 = 语音便签
+CONFIG_MUSE_REALTIME_VOICE=y
+# 外接 TTS：回复文字转语音（OpenAI 兼容 /v1/audio/speech，key 用 >tts_key= 写入）
+CONFIG_MUSE_TTS=y
+
+

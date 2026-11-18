@@ -34,6 +34,7 @@
 #include "identity.h"
 #include "noise_control.h"
 #include "sdk_token_console.h"
+#include "muse_tts.h"
 #if CONFIG_MUSE_WASM_APPS
 #include "muse_apps.h"
 #endif
@@ -663,12 +664,14 @@ static void boot_task(void *arg) {
     vTaskDelete(NULL);
 }
 
-#if CONFIG_MUSE_WASM_APPS
-// The console's setup lines: the SDK token, then the app loader (muse_apps.h).
+// The console's setup lines: the SDK token, the TTS key, then the app loader.
 static bool console_line(const char *line) {
-    return sdk_token_console_command(line) || muse_apps_console(line);
-}
+    return sdk_token_console_command(line) || muse_tts_console_command(line)
+#if CONFIG_MUSE_WASM_APPS
+        || muse_apps_console(line)
 #endif
+        ;
+}
 
 void muse_glue_start(void) {
     // First, before Link's Wi-Fi, BLE and tunnel and Muse's display take and
@@ -676,11 +679,9 @@ void muse_glue_start(void) {
     muse_input_power_init();
     s_ready = xEventGroupCreate();
     muse_link_register(&s_ops);
-#if CONFIG_MUSE_WASM_APPS
     muse_input_set_console_hook(console_line);
+#if CONFIG_MUSE_WASM_APPS
     muse_apps_start(noise_ctrl_send_command_result);
-#else
-    muse_input_set_console_hook(sdk_token_console_command);
 #endif
     muse_ble_set_name(identity_ble_name());
     ble_companion_t companion = {
