@@ -506,7 +506,10 @@ menu "Muse"
         depends on MUSE_TTS
         default "https://api.siliconflow.cn/v1/audio/speech"
         help
-          Any OpenAI-compatible POST /v1/audio/speech endpoint.
+          Any OpenAI-compatible POST /v1/audio/speech endpoint. MiniMax's
+          t2a_v2 works too: its URL (with the GroupId query, e.g.
+          "https://api.minimax.chat/v1/t2a_v2?GroupId=...") switches the
+          request and the hex-in-SSE response parsing automatically.
 
     config MUSE_TTS_MODEL
         string "TTS model"

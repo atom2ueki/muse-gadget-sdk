@@ -59,6 +59,7 @@ static SemaphoreHandle_t s_lock;
 static StreamBufferHandle_t s_stream;
 static atomic_int s_status = MUSE_TTS_IDLE;
 static atomic_bool s_abort = false;
+static atomic_bool s_api_error = false;   /* the provider answered, but with an error */
 
 /* ---- config ---- */
 
@@ -109,6 +110,99 @@ static void fetch_fail(void) {
     vTaskDelete(NULL);
 }
 
+/* MiniMax's t2a_v2 isn't OpenAI-shaped: hex-encoded MP3 chunks ride inside
+ * SSE "data:" lines, so the URL gives the provider away. */
+static bool provider_is_minimax(const char *url) {
+    return strstr(url, "minimax") != NULL;
+}
+
+static int hexval(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* One line of MiniMax's SSE stream: {"data":{"audio":"<hex>","status":1}}.
+ * Decodes the hex in place and hands the MP3 bytes to the handoff buffer.
+ * Sets saw_audio when audio arrived; a base_resp error with none fails. */
+static void tts_sse_line(char *line, bool *saw_audio) {
+    char *p = line;
+    if (!strncmp(p, "data:", 5)) p += 5;
+    while (*p == ' ') p++;
+    char *audio = strstr(p, "\"audio\":\"");
+    if (audio) {
+        audio += 9;
+        char *end = strchr(audio, '"');
+        if (!end) {
+            return;
+        }
+        size_t hexn = (size_t)(end - audio), bn = 0;
+        for (size_t i = 0; i + 1 < hexn; i += 2) {
+            int hi = hexval(audio[i]), lo = hexval(audio[i + 1]);
+            if (hi < 0 || lo < 0) {
+                return;
+            }
+            audio[bn++] = (char)((hi << 4) | lo);   /* out never overruns in */
+        }
+        size_t at = 0;
+        while (at < bn && !atomic_load(&s_abort)) {
+            size_t put = xStreamBufferSend(s_stream, audio + at, bn - at, pdMS_TO_TICKS(200));
+            at += put;
+        }
+        *saw_audio = true;
+        return;
+    }
+    const char *err = strstr(p, "\"status_code\":");
+    if (err) {
+        long code = strtol(err + 14, NULL, 10);
+        if (code) {
+            ESP_LOGW(TAG, "MiniMax answered status_code %ld", code);
+            atomic_store(&s_api_error, true);
+        }
+    }
+}
+
+/* MiniMax's response: SSE lines carrying hex audio chunks. Body bytes are
+ * buffered until a newline closes a line, then parsed; the tail is parsed
+ * when the response ends. */
+static void fetch_minimax_body(esp_http_client_handle_t http, uint8_t *buf, bool *saw_audio) {
+    enum { LINE_CAP = 32 * 1024 };
+    char *line = heap_caps_malloc(LINE_CAP, MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
+    if (!line) {
+        return;
+    }
+    size_t len = 0;
+    while (!atomic_load(&s_abort)) {
+        int n = esp_http_client_read(http, (char *)buf, CHUNK);
+        if (n < 0) {
+            break;
+        }
+        if (!n) {
+            if (esp_http_client_is_complete_data_received(http)) {
+                break;
+            }
+            continue;   /* a stall; the read timeout bounds the wait */
+        }
+        for (int i = 0; i < n; i++) {
+            if (len < LINE_CAP - 1) {
+                line[len++] = buf[i];
+            }
+            if (buf[i] != '\n') {
+                continue;
+            }
+            line[len] = '\0';
+            len = 0;
+            tts_sse_line(line, saw_audio);
+        }
+    }
+    if (len && len < LINE_CAP) {
+        line[len] = '\0';
+        tts_sse_line(line, saw_audio);
+    }
+    heap_caps_free(line);
+}
+
 static void fetch_run(fetch_t *f) {
     esp_http_client_config_t cfg = {
         .url = f->url,
@@ -126,15 +220,31 @@ static void fetch_run(fetch_t *f) {
 
     char auth[8 + sizeof(f->key)];
     char *json = NULL;
+    bool minimax = provider_is_minimax(f->url);
     if (err == ESP_OK) {
         snprintf(auth, sizeof(auth), "Bearer %s", f->key);
         cJSON *body = cJSON_CreateObject();
-        cJSON_AddStringToObject(body, "model", f->model);
-        cJSON_AddStringToObject(body, "input", f->text);
-        cJSON_AddStringToObject(body, "voice", f->voice);
-        cJSON_AddStringToObject(body, "response_format", "mp3");
-        json = body ? cJSON_PrintUnformatted(body) : NULL;
-        cJSON_Delete(body);
+        if (body) {
+            cJSON_AddStringToObject(body, "model", f->model);
+            cJSON_AddStringToObject(body, "text", f->text);
+            if (minimax) {
+                cJSON_AddBoolToObject(body, "stream", true);
+                cJSON *vs = cJSON_AddObjectToObject(body, "voice_setting");
+                cJSON_AddStringToObject(vs, "voice_id", f->voice);
+                cJSON_AddNumberToObject(vs, "speed", 1.0);
+                cJSON_AddNumberToObject(vs, "vol", 1.0);
+                cJSON_AddNumberToObject(vs, "pitch", 0);
+                cJSON *as = cJSON_AddObjectToObject(body, "audio_setting");
+                cJSON_AddNumberToObject(as, "sample_rate", 32000);
+                cJSON_AddStringToObject(as, "format", "mp3");
+                cJSON_AddNumberToObject(as, "channel", 1);
+            } else {
+                cJSON_AddStringToObject(body, "voice", f->voice);
+                cJSON_AddStringToObject(body, "response_format", "mp3");
+            }
+            json = cJSON_PrintUnformatted(body);
+            cJSON_Delete(body);
+        }
         if (!json) {
             ESP_LOGE(TAG, "out of memory for the request body");
             err = ESP_FAIL;
@@ -161,6 +271,8 @@ static void fetch_run(fetch_t *f) {
         }
     }
     cJSON_free(json);
+    bool saw_audio = false;
+    atomic_store(&s_api_error, false);
     if (err == ESP_OK && !atomic_load(&s_abort)) {
         /* Response body: MP3 bytes, streamed into the handoff buffer. A busy
          * decode backs this up, so keep trying to send while not aborted. */
@@ -168,22 +280,27 @@ static void fetch_run(fetch_t *f) {
         if (!buf) {
             err = ESP_FAIL;
         } else {
-            while (!atomic_load(&s_abort)) {
-                int n = esp_http_client_read(http, (char *)buf, CHUNK);
-                if (n < 0) {
-                    err = ESP_FAIL;
-                    break;
-                }
-                if (!n) {
-                    if (esp_http_client_is_complete_data_received(http)) {
+            if (minimax) {
+                fetch_minimax_body(http, buf, &saw_audio);
+            } else {
+                while (!atomic_load(&s_abort)) {
+                    int n = esp_http_client_read(http, (char *)buf, CHUNK);
+                    if (n < 0) {
+                        err = ESP_FAIL;
                         break;
                     }
-                    continue;   /* a stall; the read timeout bounds the wait */
-                }
-                size_t at = 0;
-                while (at < (size_t)n && !atomic_load(&s_abort)) {
-                    size_t put = xStreamBufferSend(s_stream, buf + at, n - at, pdMS_TO_TICKS(200));
-                    at += put;
+                    if (!n) {
+                        if (esp_http_client_is_complete_data_received(http)) {
+                            break;
+                        }
+                        continue;   /* a stall; the read timeout bounds the wait */
+                    }
+                    size_t at = 0;
+                    while (at < (size_t)n && !atomic_load(&s_abort)) {
+                        size_t put = xStreamBufferSend(s_stream, buf + at, n - at, pdMS_TO_TICKS(200));
+                        at += put;
+                    }
+                    saw_audio = true;
                 }
             }
             heap_caps_free(buf);
@@ -194,7 +311,8 @@ static void fetch_run(fetch_t *f) {
     heap_caps_free(f);
     if (atomic_load(&s_abort)) {
         set_status(MUSE_TTS_IDLE);   /* aborted: the caller moved on */
-    } else if (err != ESP_OK) {
+    } else if (err != ESP_OK || (minimax && !saw_audio) ||
+               (!minimax && atomic_load(&s_api_error))) {
         fetch_fail();
         return;
     } else {
